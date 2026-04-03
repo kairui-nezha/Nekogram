@@ -1,0 +1,82 @@
+name: Auto Sync and Build Nekogram
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # 每天 UTC 时间 2 点检查更新
+  workflow_dispatch: # 允许在 Actions 页面手动触发，方便调试和立即构建
+
+jobs:
+  sync_and_build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必须开放写权限，以便将上游更新推送到你的仓库
+
+    steps:
+      # 1. 检出代码，必须拉取所有子模块（Telegram 源码强依赖）
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      # 2. 同步上游 Nekogram 官方仓库
+      - name: Sync from Upstream
+        id: sync
+        run: |
+          UPSTREAM_URL="https://github.com/Nekogram/Nekogram.git"
+          BRANCH="master"
+          
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          git remote add upstream $UPSTREAM_URL
+          git fetch upstream
+          
+          LOCAL_COMMIT=$(git rev-parse HEAD)
+          UPSTREAM_COMMIT=$(git rev-parse upstream/$BRANCH)
+          
+          if [ "$LOCAL_COMMIT" != "$UPSTREAM_COMMIT" ]; then
+            echo "发现 Nekogram 上游更新，正在合并..."
+            git merge upstream/$BRANCH --no-edit
+            
+            # 更新子模块，防止合并后发生子模块指针错乱
+            git submodule update --init --recursive
+            
+            git push origin $BRANCH
+            echo "updated=true" >> $GITHUB_OUTPUT
+          else
+            echo "当前已是最新版本，无需更新。"
+            # 提示：如果你想强制每次都构建，可以将下面的 false 改为 true
+            echo "updated=false" >> $GITHUB_OUTPUT
+          fi
+
+      # 3. 配置 Java 构建环境
+      - name: Set up JDK 17
+        if: steps.sync.outputs.updated == 'true'
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      # 4. 写入 Telegram API 密钥到 local.properties
+      - name: Create local.properties
+        if: steps.sync.outputs.updated == 'true'
+        run: |
+          echo "APP_ID=${{ secrets.TELEGRAM_APP_ID }}" >> local.properties
+          echo "APP_HASH=${{ secrets.TELEGRAM_APP_HASH }}" >> local.properties
+          
+      # 5. 执行 Gradle 构建 (仅编译 arm64-v8a 架构以节省时间)
+      - name: Build APK (ARM64 only)
+        if: steps.sync.outputs.updated == 'true'
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleArm64_v8aRelease
+
+      # 6. 上传未签名的 APK 作为构建产物
+      - name: Upload Unsigned APK
+        if: steps.sync.outputs.updated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nekogram-arm64-v8a-Unsigned
+          path: TMessagesProj/build/outputs/apk/arm64_v8a/release/*.apk
